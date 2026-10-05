@@ -217,9 +217,13 @@ def build_email_send(rt: Any, settings: Any, args: dict) -> Built:
             return f"{len(dupes)} email(s) are identical to ones sent in the last 24h; set allow_duplicate=true to send anyway"
         return None
 
-    def after_send(rt_: Any, accepted_or_unknown: bool) -> None:
-        if accepted_or_unknown:  # an ambiguous failure may still have sent: block blind resends too
-            rt_.ledger.record(fingerprints)
+    def reserve(rt_: Any) -> list[str]:
+        # Recorded under rt.gate BEFORE the POST, so a concurrent call with a different token and the same
+        # content is refused by precheck. Ambiguous failures keep the reservation (they may have sent).
+        return rt_.ledger.reserve(fingerprints)
+
+    def release(rt_: Any, fresh: list[str]) -> None:
+        rt_.ledger.release(fresh)  # Bento definitely rejected it (4xx): allow a corrected resend
 
     shown = ", ".join(tos[:3]) + (f" +{len(tos) - 3} more" if len(tos) > 3 else "")
     summary = {"from": sender, "to": shown, "subject": entries[0]["subject"], "body": _snippet(entries[0]["html_body"]),
@@ -228,7 +232,7 @@ def build_email_send(rt: Any, settings: Any, args: dict) -> Built:
         summary["reason"] = reason
     return Built("POST", "/batch/emails", {"emails": entries}, T3, count=len(entries), summary=summary, warnings=warnings,
                  recipients=tos, audit_extra={"reason": reason} if reason else {}, context=context,
-                 precheck=precheck, after_send=after_send)
+                 precheck=precheck, reserve=reserve, release=release)
 
 
 SPECS: list[ToolSpec] = [

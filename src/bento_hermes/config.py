@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -165,6 +166,7 @@ class Runtime:
         self._sleep = sleep
         self._monotonic = monotonic
         self.cache = TTLCache(monotonic)
+        self.gate = threading.Lock()  # token claim + duplicate reservation; never held across a send
         self._guards: dict[str, RateGuard] = {}
         self.tokens = TokenService(self.state_get, self.state_set, clock)
         self.ledger = DedupeLedger(self.state_get, self.state_set, clock)

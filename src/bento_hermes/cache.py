@@ -66,6 +66,22 @@ class DedupeLedger:
         ledger = self._load()
         return [f for f in fingerprints if f in ledger]
 
+    def reserve(self, fingerprints: list[str]) -> list[str]:
+        """Record fingerprints as sent-or-in-flight; return only the ones that were not already present."""
+        fresh = [f for f in dict.fromkeys(fingerprints) if f not in self._load()]
+        self.record(fingerprints)
+        return fresh
+
+    def release(self, fingerprints: list[str]) -> None:
+        """Undo a ``reserve`` after a definite non-send (never touches earlier, genuinely sent entries)."""
+        if not fingerprints:
+            return
+        ledger = self._load()
+        for fp in fingerprints:
+            ledger.pop(fp, None)
+            self._memory.pop(fp, None)
+        self._set(self.KEY, ledger)
+
     def record(self, fingerprints: list[str]) -> None:
         ledger = self._load()
         now = self._clock()

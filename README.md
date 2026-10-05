@@ -88,7 +88,8 @@ All of this is code (`src/bento_hermes/safety.py`) with tests, not instructions 
 1. **Dry run first.** `bento_broadcast_schedule` and `bento_email_send` default to `dry_run=true`. A dry run performs no POST.
    It returns the exact request body, validation results, lint warnings, read-only context (tag existence, segment size,
    duplicate check, throttle ETA) and a `confirm_token`. T2 tools accept `dry_run=true` too.
-2. **Confirm token.** `HMAC-SHA256(per-profile key, tool + site + exact request + expiry + nonce)`. 15 minute TTL, single use.
+2. **Confirm token.** `HMAC-SHA256(per-profile key, tool + site + exact request + expiry + nonce)`. 15 minute TTL, single use. "Single use" is atomic: token check, duplicate check and token consumption run under one lock
+   (never held across the send), so parallel tool calls with the same token produce exactly one POST.
    The real call must repeat the *identical* parameters with `dry_run=false` and the token. Change anything and it is refused
    (`payload changed since preview`). Preview A, send B is impossible; replay is impossible.
 3. **Human approval.** The plugin registers a `pre_tool_call` hook that returns `{"action": "approve"}` for real T3 calls (and for T2
@@ -178,6 +179,8 @@ Example: `hermes config set plugins.entries.bento.settings.allowed_senders '["ne
 Not yet verified against a live Bento site (no account when this was built); these Bento facts are inconsistent in Bento's own docs and are
 handled conservatively: the broadcast `type` enum (`plain|raw` per docs; the plugin accepts only those), the `/batch/emails` cap (60 per docs, 100 in an SDK comment: 60 used),
 the `POST /fetch/tags|fields` body wrappers (from the Node SDK), the `cart.items[].price` key (from Bento's JS docs, in cents like `value.amount`), and `approved: true` + `send_at` on broadcasts (docs.bentonow.com/broadcasts).
+The single-use lock and the duplicate ledger are per Hermes process; two separate processes sharing one profile (e.g. a gateway and a
+concurrent CLI/cron run) are not serialised against each other, so do not run the same send from two processes at once.
 Smoke-test on a throwaway Bento site (`hermes bento status`, then a dry run of every T3 tool) before pointing it at a real list.
 
 ## Development

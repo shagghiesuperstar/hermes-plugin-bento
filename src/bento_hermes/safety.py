@@ -18,7 +18,9 @@ import json
 import logging
 import re
 import secrets
+import threading
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -68,6 +70,11 @@ class Built:
     context: Callable[[Any], dict] | None = None  # dry-run only, GETs only: rt -> dict
     precheck: Callable[[Any], str | dict | None] | None = None  # real call: refusal text | final result | None
     after_send: Callable[[Any, bool], None] | None = None  # (rt, accepted_or_ambiguous)
+    # reserve/release run under rt.gate together with the token claim, so two concurrent calls with
+    # DIFFERENT tokens for the same content cannot both pass the duplicate check. reserve(rt) returns an
+    # opaque handle; release(rt, handle) is called only after a definite non-send (4xx).
+    reserve: Callable[[Any], Any] | None = None
+    release: Callable[[Any, Any], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -184,7 +191,8 @@ class TokenService:
         return {k: v for k, v in merged.items() if v >= now}
 
     def check(self, tool: str, phash: str, token: Any) -> str | None:
-        """Return a refusal reason, or ``None`` when the token is valid. Does not consume."""
+        """Return a refusal reason, or ``None`` when the token is valid. Does not consume. A caller that
+        goes on to send must hold ``Runtime.gate`` across check -> consume (see ``execute``)."""
         if not isinstance(token, str) or token.count(".") != 3:
             return "confirm_token is missing or malformed"
         prefix, expiry_text, nonce, mac = token.split(".")
@@ -200,6 +208,7 @@ class TokenService:
         return None
 
     def consume(self, token: str) -> None:
+        """Mark a token used. Callers MUST hold ``Runtime.gate`` from ``check()`` until this returns."""
         mac = token.split(".")[3]
         used = self._used_map()
         used[mac] = int(token.split(".")[1])
@@ -307,31 +316,44 @@ def execute(rt: Runtime, spec: ToolSpec, args: dict) -> str:
 
     needs_token = token_required(built.tier, settings)
     token = args.get("confirm_token")
-    if needs_token:
-        if not token:
-            return _refused(spec.name, "no confirm_token. Run this call with dry_run=true first, review the exact "
-                            "payload, then re-call with dry_run=false and the returned confirm_token.", tier=tier_label(built.tier))
-        reason = rt.tokens.check(spec.name, phash, token)
-        if reason:
-            return _refused(spec.name, reason, tier=tier_label(built.tier))
-    if built.acks_missing:
-        return _refused(spec.name, "missing acknowledgement(s): " + "; ".join(built.acks_missing), tier=tier_label(built.tier))
-    if built.precheck is not None:
-        outcome = built.precheck(rt)
-        if isinstance(outcome, dict):
-            return to_json(outcome)
-        if outcome:
-            return _refused(spec.name, outcome, tier=tier_label(built.tier))
+    if needs_token and not token:
+        return _refused(spec.name, "no confirm_token. Run this call with dry_run=true first, review the exact "
+                        "payload, then re-call with dry_run=false and the returned confirm_token.", tier=tier_label(built.tier))
 
-    audit_base = {"tool": spec.name, "tier": tier_label(built.tier), "phash": phash[:16], "count": built.count,
-                  **built.audit_extra}
-    audited = rt.audit_event({**audit_base, "stage": "attempt"}, recipients=built.recipients)
-    if built.tier == T3 and not audited:
-        return _refused(spec.name, "audit log is not writable; sends are refused when they cannot be audited")
-    if needs_token:
-        rt.tokens.consume(str(token))
+    # Critical section. Hermes may run several tool calls from one assistant turn on parallel threads, so
+    # "token valid -> token used" and "not a duplicate -> recorded as sent" must each be atomic. The gate
+    # is held from the first token check until the token is consumed and the duplicate fingerprints are
+    # reserved. It is NEVER held across the HTTP send. Gate order: every refusal below returns BEFORE the
+    # token is consumed, so a refused call leaves the token usable; once consumed it is spent even if the
+    # send then fails (a fresh dry run is required). The gate is per process: it does not serialise
+    # separate Hermes processes (see README, Known gaps).
+    gated = needs_token or built.reserve is not None
+    reservation: Any = None
+    with rt.gate if gated else nullcontext():
+        if needs_token:
+            reason = rt.tokens.check(spec.name, phash, token)
+            if reason:
+                return _refused(spec.name, reason, tier=tier_label(built.tier))
+        if built.acks_missing:
+            return _refused(spec.name, "missing acknowledgement(s): " + "; ".join(built.acks_missing), tier=tier_label(built.tier))
+        if built.precheck is not None:
+            outcome = built.precheck(rt)
+            if isinstance(outcome, dict):
+                return to_json(outcome)
+            if outcome:
+                return _refused(spec.name, outcome, tier=tier_label(built.tier))
 
-    client = rt.client()
+        client = rt.client()  # resolve BEFORE the token is spent: missing credentials must not burn it
+        audit_base = {"tool": spec.name, "tier": tier_label(built.tier), "phash": phash[:16], "count": built.count,
+                      **built.audit_extra}
+        audited = rt.audit_event({**audit_base, "stage": "attempt"}, recipients=built.recipients)
+        if built.tier == T3 and not audited:
+            return _refused(spec.name, "audit log is not writable; sends are refused when they cannot be audited")
+        if needs_token:
+            rt.tokens.consume(str(token))
+        if built.reserve is not None:
+            reservation = built.reserve(rt)
+
     try:
         if built.method == "GET":
             response = client.get(built.path, built.params)
@@ -339,6 +361,9 @@ def execute(rt: Runtime, spec: ToolSpec, args: dict) -> str:
             response = client.post(built.path, built.body or {}, idempotent=built.idempotent, params=built.params)
     except BentoError as err:
         ambiguous = err.kind in ("network", "non_json") or (err.status is not None and err.status >= 500)
+        if built.release is not None and not ambiguous:
+            with rt.gate:  # definite non-send: give the duplicate-ledger reservation back
+                built.release(rt, reservation)
         if built.after_send is not None:
             built.after_send(rt, ambiguous)
         rt.audit_event({**audit_base, "stage": "result", "outcome": "ambiguous" if ambiguous else "rejected",
