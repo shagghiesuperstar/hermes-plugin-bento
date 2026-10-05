@@ -1,7 +1,7 @@
 """Cross-process claim lock: one critical section shared by every Hermes process on a profile.
 
 A confirm token must be spent, and a duplicate-send fingerprint reserved, by exactly one caller. Hermes's
-gateway and its cron jobs are separate processes that share ``<HERMES_HOME>/plugin-data/bento/``, and
+gateway and its cron jobs are separate processes that share ``ctx.state.data_dir`` (``plugin-data/agent-plugin-bento-4243b479/`` for this plugin id), and
 ``ctx.state`` is atomic only per ``get``/``set``, not across the plugin's read-modify-write of
 ``used_tokens`` / ``email_ledger``. So the whole check -> consume -> reserve sequence runs under an
 exclusive OS file lock (``flock`` on POSIX, ``msvcrt.locking`` on Windows) plus a thread lock. The lock is

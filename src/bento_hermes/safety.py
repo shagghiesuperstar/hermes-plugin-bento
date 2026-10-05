@@ -461,9 +461,13 @@ def approval_message(spec: ToolSpec, built: Built, phash: str) -> str:
     return clean_line("; ".join(bits), 600)
 
 
-def _one_shot_id(token: Any) -> str:
-    """Token nonce when the call carries a (checked) confirm token, else a fresh random id."""
-    if isinstance(token, str) and token.count(".") == 3 and token.split(".")[2].isalnum():
+def _one_shot_id(tier: int, token: Any) -> str:
+    """T3: the nonce of the confirm token the hook has just checked. T2: always a fresh random id.
+
+    The T2 handler neither checks nor spends a confirm token, so a token (replayable with a changed
+    payload) must never seed the key Hermes stores for "[a]lways".
+    """
+    if tier == T3 and isinstance(token, str) and token.count(".") == 3 and token.split(".")[2].isalnum():
         return token.split(".")[2]
     return secrets.token_hex(8)
 
@@ -472,8 +476,8 @@ def make_pre_tool_call(rt: Runtime, registry: dict[str, ToolSpec]) -> Callable[.
     """Build the hook. For real (non-dry-run) T3 calls - and T2 calls unless ``safety.tier2`` is
     ``token_only`` - return ``{"action": "approve"}`` so Hermes's human gate asks a person.
 
-    The ``rule_key`` is one-shot: it embeds the confirm token's nonce (T3) or a fresh random id (T2 without
-    a token), never the payload hash. Hermes stores "[a]lways" / "[s]ession" approvals as a standing key, so a
+    The ``rule_key`` is one-shot: it embeds the checked confirm token's nonce (T3) or a fresh random id (T2,
+    any token ignored), never the payload hash. Hermes stores "[a]lways" / "[s]ession" approvals as a standing key, so a
     payload-hash key would let a later dry run of the same payload skip the human. A nonce key is spent with
     its single-use token, so "always" approves exactly this call and nothing after it.
     """
@@ -501,7 +505,7 @@ def make_pre_tool_call(rt: Runtime, registry: dict[str, ToolSpec]) -> Callable[.
                     return {"action": "block", "message": f"{tool_name} blocked before approval: {reason}. "
                             "Run dry_run=true first and pass the returned confirm_token."}
             return {"action": "approve", "message": approval_message(spec, built, phash),
-                    "rule_key": f"bento:{tool_name}:{_one_shot_id(call_args.get('confirm_token'))}"}
+                    "rule_key": f"bento:{tool_name}:{_one_shot_id(built.tier, call_args.get('confirm_token'))}"}
         except ValidationError:
             return None  # the handler returns the same validation error; nothing can be sent
         except Exception:  # noqa: BLE001 - fail closed on ANY gate error, with a traceback in the log
