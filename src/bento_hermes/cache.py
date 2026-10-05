@@ -1,4 +1,4 @@
-"""Small in-process TTL cache and a persistent 24h duplicate-send ledger."""
+"""Small in-process TTL cache and a persistent 24h duplicate-send ledger (shared across processes)."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import hashlib
 import time
 from collections.abc import Callable
 from typing import Any
+
+from .claim import ClaimError
 
 LEDGER_TTL_SECONDS = 24 * 3600
 LEDGER_MAX_ENTRIES = 5000
@@ -44,7 +46,12 @@ def email_fingerprint(site_uuid: str, to: str, subject: str, body: str) -> str:
 
 
 class DedupeLedger:
-    """24h ledger of (site, to, subject, body) hashes kept in ``ctx.state`` (profile scoped)."""
+    """24h ledger of (site, to, subject, body) hashes kept in ``ctx.state`` (profile scoped).
+
+    ``state_get`` must raise ``ClaimError`` when the stored ledger cannot be read, and every write that
+    fails to persist raises ``ClaimError``: a reservation that is not on disk would not stop a second
+    process. ``reserve``/``release`` must run under the cross-process claim lock (``Runtime.gate``).
+    """
 
     KEY = "email_ledger"
 
@@ -53,12 +60,10 @@ class DedupeLedger:
         self._get = state_get
         self._set = state_set
         self._clock = clock
-        self._memory: dict[str, float] = {}
 
     def _load(self) -> dict[str, float]:
         stored = self._get(self.KEY, None)
         merged = dict(stored) if isinstance(stored, dict) else {}
-        merged.update(self._memory)
         cutoff = self._clock() - LEDGER_TTL_SECONDS
         return {k: v for k, v in merged.items() if isinstance(v, (int, float)) and v >= cutoff}
 
@@ -68,7 +73,8 @@ class DedupeLedger:
 
     def reserve(self, fingerprints: list[str]) -> list[str]:
         """Record fingerprints as sent-or-in-flight; return only the ones that were not already present."""
-        fresh = [f for f in dict.fromkeys(fingerprints) if f not in self._load()]
+        present = self._load()
+        fresh = [f for f in dict.fromkeys(fingerprints) if f not in present]
         self.record(fingerprints)
         return fresh
 
@@ -79,16 +85,18 @@ class DedupeLedger:
         ledger = self._load()
         for fp in fingerprints:
             ledger.pop(fp, None)
-            self._memory.pop(fp, None)
-        self._set(self.KEY, ledger)
+        self._persist(ledger)
 
     def record(self, fingerprints: list[str]) -> None:
         ledger = self._load()
         now = self._clock()
         for fp in fingerprints:
             ledger[fp] = now
-            self._memory[fp] = now
         if len(ledger) > LEDGER_MAX_ENTRIES:
             newest = sorted(ledger.items(), key=lambda kv: kv[1], reverse=True)[:LEDGER_MAX_ENTRIES]
             ledger = dict(newest)
-        self._set(self.KEY, ledger)
+        self._persist(ledger)
+
+    def _persist(self, ledger: dict[str, float]) -> None:
+        if not self._set(self.KEY, ledger):
+            raise ClaimError("could not persist the duplicate-send ledger")

@@ -198,7 +198,7 @@ class BentoClient:
         try:
             return json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
-            snippet = self._clean(raw[:160].decode("utf-8", "replace"))
+            snippet = self._clean(raw.decode("utf-8", "replace"))[:160]  # redact FIRST, then cut
             raise BentoError(
                 "Bento returned a non-JSON body (HTML usually means the User-Agent was blocked by "
                 f"Cloudflare). Snippet: {snippet!r}",
@@ -211,7 +211,7 @@ class BentoClient:
         try:
             detail = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
-            detail = {"body_snippet": raw[:160].decode("utf-8", "replace")}
+            detail = {"body_snippet": self._clean(raw.decode("utf-8", "replace"))[:160]}
         if isinstance(detail, dict) and retry_after is not None:
             detail = {**detail, "retry_after": retry_after}
         hint = {
@@ -222,7 +222,7 @@ class BentoClient:
             422: "Bento rejected the request (business rule, e.g. sender is not a verified Author)",
             429: "rate limited by Bento",
         }.get(status, "server error" if status >= 500 else "request failed")
-        text = self._clean(json.dumps(detail, default=str)[:500])
+        text = self._clean(json.dumps(detail, default=str))[:500]  # redact the WHOLE text, then cut: a key straddling the cut cannot leak a prefix
         return BentoError(f"Bento HTTP {status}: {hint}. Response: {text}", status=status, kind="http", detail=detail)
 
     def _clean(self, text: str) -> str:

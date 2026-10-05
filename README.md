@@ -88,16 +88,31 @@ All of this is code (`src/bento_hermes/safety.py`) with tests, not instructions 
 1. **Dry run first.** `bento_broadcast_schedule` and `bento_email_send` default to `dry_run=true`. A dry run performs no POST.
    It returns the exact request body, validation results, lint warnings, read-only context (tag existence, segment size,
    duplicate check, throttle ETA) and a `confirm_token`. T2 tools accept `dry_run=true` too.
-2. **Confirm token.** `HMAC-SHA256(per-profile key, tool + site + exact request + expiry + nonce)`. 15 minute TTL, single use. "Single use" is atomic: token check, duplicate check and token consumption run under one lock
-   (never held across the send), so parallel tool calls with the same token produce exactly one POST.
+2. **Confirm token.** `HMAC-SHA256(per-profile key, tool + site + exact request + expiry + nonce)`. 15 minute TTL, single use.
    The real call must repeat the *identical* parameters with `dry_run=false` and the token. Change anything and it is refused
-   (`payload changed since preview`). Preview A, send B is impossible; replay is impossible.
+   (`payload changed since preview`), so a token cannot be used to send a different payload than the one previewed.
+   **What "single use" guarantees, and what it does not.**
+   - The token check, the token spend and the duplicate-fingerprint reservation are one critical section under an exclusive
+     OS file lock (`<HERMES_HOME>/plugin-data/bento/claims.lock`) plus an in-process lock. Every process on the profile
+     (gateway, CLI, cron) takes the same lock, so two processes or threads presenting the same token, or two different tokens
+     for the same email content, cannot both pass: one wins the claim, the others are refused. The lock is never held across the HTTP send.
+   - If the claim cannot be taken or persisted (lock timeout, plugin state unreadable or unwritable, no data dir), the send is
+     refused and the token is not spent.
+   - A token is spent *before* the POST. If the POST then fails ambiguously (timeout, 5xx) the result is `sent: "unknown"`, the token
+     is gone, and the duplicate reservation is kept. A later fresh dry run plus approval for the same email content is refused for 24 h
+     unless `allow_duplicate=true`; that is how an unknown outcome is kept from turning into a second send by accident, not a proof of one POST.
+   - Duplicate suppression covers `bento_email_send` only. `bento_broadcast_schedule` is protected by the token alone: two separate
+     dry runs give two valid tokens, and each can schedule the same broadcast (check the Bento dashboard before re-running).
+   - The lock is local to one `HERMES_HOME`. It does not coordinate separate machines or profiles, and it depends on the OS file lock
+     working on that filesystem (some network filesystems do not honour it).
+   - Bento's API has no idempotency key for these endpoints, so the plugin cannot make Bento itself deduplicate.
 3. **Human approval.** The plugin registers a `pre_tool_call` hook that returns `{"action": "approve"}` for real T3 calls (and for T2
    calls unless `safety.tier2` is `token_only`). Hermes then asks a person, showing the sender, up to three recipients, the subject,
    the start of the body (or the audience and send time for a broadcast) and the payload hash.
-   Denial, timeout or a gate error fails closed. The `rule_key` embeds the payload hash, so choosing "always" at the prompt can only
-   ever re-approve that one identical, single-use payload, never "all Bento sends". The approval text is stripped of control and
-   invisible characters, so message content cannot forge the prompt.
+   Denial, timeout or a gate error fails closed. The approval `rule_key` is one-shot: it carries the confirm token's nonce (a fresh random
+   id for T2 calls, which have no token) and never the payload hash. Hermes stores "[a]lways" and "[s]ession" approvals under that key, so
+   choosing "always" approves this one call only; a later dry run of an identical payload gets a new nonce and asks the human again.
+   The approval text is stripped of control and invisible characters, so message content cannot forge the prompt.
 4. **Hard guards for T3 (config cannot relax them):** an explicit audience (`inclusive_tags` or `segment_id`, never "all");
    `from` must be listed in `allowed_senders` (empty list = T3 refused); `send_at` must be at least `min_schedule_lead_minutes`
    (floor 5, default 30) ahead and within 90 days; `batch_size_per_hour` explicit and <= `max_batch_size_per_hour`;
@@ -106,12 +121,16 @@ All of this is code (`src/bento_hermes/safety.py`) with tests, not instructions 
    tag audiences need `acknowledge_unknown_audience=true` because the API cannot report their size.
 5. **No automatic retries of anything that sends.** Reads retry on 429/5xx with backoff; `$purchase` retries because its
    `unique.key` makes it idempotent; email and broadcast POSTs never retry, and an ambiguous failure is reported as `sent: "unknown"`.
-6. **Environment guard.** `environment: disabled` makes every T2/T3 tool refuse (Bento advises against sending data from local or CI).
+6. **Environment guard.** `environment: disabled` makes every T2/T3 tool refuse. `environment: staging` does **not** block anything: the plugin
+   treats it exactly like `production`, and a confirmed T3 send under `staging` still emails real people. The plugin has no sandbox or test mode
+   (Bento has none either); use `disabled` where sends must not happen (Bento advises against sending data from local or CI).
 7. **Audit log.** Append-only JSONL at `<HERMES_HOME>/plugin-data/bento/audit.jsonl`: tool, tier, payload hash, outcome, counts.
    No keys, no message bodies; recipient emails are hashed unless `audit.log_emails` is on. If the log cannot be written, T3 sends are refused.
-8. **Bento-served content is untrusted.** Subscriber fields, tag names and broadcast bodies are returned in an envelope marked
-   `untrusted_content: true`, stripped of control and invisible/bidi characters and length-capped, so a poisoned field is data, not instructions.
-   Even a successful injection cannot send: sends need the token and the human approval above.
+8. **Bento-served content is untrusted, in every tool result.** Subscriber fields, tag names, broadcast bodies, dry-run context, the
+   `bento_response` of a write or send, and the body text inside Bento error messages are all marked `untrusted_content: true` with an
+   `untrusted_fields` list naming where the Bento text is (read tools wrap it in a `data` envelope). Each is stripped of control and
+   invisible/bidi characters and length-capped, so a poisoned field is data, not instructions. Error bodies are redacted of the API keys
+   first and cut to length afterwards, so a key straddling the cut cannot leak a prefix. Even a successful injection cannot send: sends need the token and the human approval above.
 9. **Client-side budgets.** 60 requests/min for fetch+batch and 30/hour for stats (Bento's documented lower numbers) are enforced locally;
    when spent, a call is refused immediately instead of hanging the agent. Redirects are never followed, so credentials cannot be sent to another host.
 
@@ -125,7 +144,7 @@ Set with `hermes config set plugins.entries.bento.settings.<key> <value>` (the D
 
 | Key | Default | Meaning |
 |---|---|---|
-| `environment` | `production` | `production` / `staging` / `disabled`. Unknown values fail closed to `disabled`. |
+| `environment` | `production` | `production` / `staging` / `disabled`. Only `disabled` refuses T2/T3 tools; `staging` behaves like `production` and **still emails real people**. Unknown values fail closed to `disabled`. |
 | `allowed_senders` | `[]` | verified Bento Author addresses allowed as From. Empty = T3 refused. |
 | `bulk_threshold` | `25` | upserts above this size are T2 |
 | `safety.tier2` | `approve` | `approve` = human approval for T2; `token_only` = dry-run token only |
@@ -168,19 +187,20 @@ Example: `hermes config set plugins.entries.bento.settings.allowed_senders '["ne
   and `bento_purchase_track` can trigger Bento Flows that email people. They are gated as described above.
 - **Network:** only `https://app.bentonow.com/api/v1`, with your keys, nothing else. Optional `base_url` override accepts only `*.bentonow.com` or loopback.
 - **Data:** subscriber PII you ask it to read or write is exchanged with Bento (Bento is the processor).
-- **Storage:** only `<HERMES_HOME>/plugin-data/bento/` (state: signing key, used tokens, duplicate ledger; audit log). Credentials stay in the profile `.env`.
+- **Storage:** only `<HERMES_HOME>/plugin-data/bento/` (state: signing key, used tokens, duplicate ledger; audit log; `claims.lock`, an empty lock file for the cross-process claim). Credentials stay in the profile `.env`.
 - **Reads outside the plugin's own data:** the three `BENTO_*` variables via Hermes's secret scope / environment, plugin settings. Nothing else.
 - **No** telemetry, usage reporting, self-update, subprocesses, shell commands, background processes, or changes to Hermes core.
 - **Internal Hermes API used:** `agent.secret_scope.get_secret` (internal, not a documented plugin API), imported defensively with an `os.environ` fallback.
-- **Approval behaviour:** relies on `pre_tool_call` -> `approve` failing closed. See "What the plugin cannot do".
+- **Approval behaviour:** relies on `pre_tool_call` -> `approve` failing closed. Under cron this holds only while `approvals.cron_mode` is not `approve` (and likewise `single_query_mode` / `unattended_mode` for those surfaces). See "What the plugin cannot do".
 
 ## Known gaps
 
 Not yet verified against a live Bento site (no account when this was built); these Bento facts are inconsistent in Bento's own docs and are
 handled conservatively: the broadcast `type` enum (`plain|raw` per docs; the plugin accepts only those), the `/batch/emails` cap (60 per docs, 100 in an SDK comment: 60 used),
 the `POST /fetch/tags|fields` body wrappers (from the Node SDK), the `cart.items[].price` key (from Bento's JS docs, in cents like `value.amount`), and `approved: true` + `send_at` on broadcasts (docs.bentonow.com/broadcasts).
-The single-use lock and the duplicate ledger are per Hermes process; two separate processes sharing one profile (e.g. a gateway and a
-concurrent CLI/cron run) are not serialised against each other, so do not run the same send from two processes at once.
+The single-use lock and the duplicate ledger are shared by every process on one `HERMES_HOME` through an OS file lock (see the Safety model); they do
+not coordinate separate machines or profiles, and `bento_broadcast_schedule` has no duplicate ledger (token only). The cross-process claim is tested with
+two real processes on a file-backed state, not against a live gateway plus a live cron job; the file-lock path on Windows is implemented (`msvcrt.locking`) but not yet exercised there.
 Smoke-test on a throwaway Bento site (`hermes bento status`, then a dry run of every T3 tool) before pointing it at a real list.
 
 ## Development

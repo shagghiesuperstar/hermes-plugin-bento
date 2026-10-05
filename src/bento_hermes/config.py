@@ -6,7 +6,6 @@ import hashlib
 import logging
 import os
 import re
-import threading
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .cache import DedupeLedger, TTLCache
+from .claim import LOCK_FILENAME, ClaimError, ClaimLock
 from .client import DEFAULT_BASE_URL, BentoClient, BentoError, Credentials, RateGuard
 from .safety import AuditLog, TokenService
 
@@ -166,10 +166,12 @@ class Runtime:
         self._sleep = sleep
         self._monotonic = monotonic
         self.cache = TTLCache(monotonic)
-        self.gate = threading.Lock()  # token claim + duplicate reservation; never held across a send
+        # token claim + duplicate reservation: thread lock + OS file lock, so it also serialises separate
+        # Hermes processes (gateway, cron) on one profile. Never held across a send.
+        self.gate = ClaimLock(self._claim_path)
         self._guards: dict[str, RateGuard] = {}
-        self.tokens = TokenService(self.state_get, self.state_set, clock)
-        self.ledger = DedupeLedger(self.state_get, self.state_set, clock)
+        self.tokens = TokenService(self.state_get, self.state_set, clock, strict_get=self.state_get_strict)
+        self.ledger = DedupeLedger(self.state_get_strict, self.state_set, clock)
         self.audit = AuditLog(self._audit_path, clock)
 
     # -- plugin state / config (all failures degrade, never raise into a tool call) -----------------
@@ -187,6 +189,15 @@ class Runtime:
             logger.warning("bento: plugin state read failed for %s", key, exc_info=True)
             return default
 
+    def state_get_strict(self, key: str, default: Any = None) -> Any:
+        """Like ``state_get`` but a read failure raises ``ClaimError``: used where a silent default would
+        mean "not spent / not sent yet" and let a second process through."""
+        try:
+            return self.ctx.state.get(key, default)
+        except (ValueError, OSError, RuntimeError, AttributeError) as err:
+            logger.warning("bento: plugin state read failed for %s", key, exc_info=True)
+            raise ClaimError(f"plugin state is unreadable ({type(err).__name__})") from None
+
     def state_set(self, key: str, value: Any) -> bool:
         try:
             self.ctx.state.set(key, value)
@@ -195,12 +206,20 @@ class Runtime:
             logger.warning("bento: plugin state write failed for %s", key, exc_info=True)
             return False
 
-    def _audit_path(self) -> Path | None:
+    def _data_dir(self) -> Path | None:
         try:
             data_dir = getattr(self.ctx.state, "data_dir", None)
         except (ValueError, OSError, RuntimeError, AttributeError):
             return None
-        return Path(data_dir) / "audit.jsonl" if data_dir else None
+        return Path(data_dir) if data_dir else None
+
+    def _audit_path(self) -> Path | None:
+        data_dir = self._data_dir()
+        return data_dir / "audit.jsonl" if data_dir else None
+
+    def _claim_path(self) -> Path | None:
+        data_dir = self._data_dir()
+        return data_dir / LOCK_FILENAME if data_dir else None
 
     def settings(self) -> Settings:
         return Settings.load(self._config)

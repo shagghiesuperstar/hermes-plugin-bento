@@ -48,7 +48,7 @@ config_schema:
     type: str
     choices: [production, staging, disabled]
     default: production
-    description: "'disabled' makes every write/send tool refuse (Bento advises against sending data from local/CI)."
+    description: "Only 'disabled' makes every write/send tool refuse. 'staging' behaves like production and still emails real people."
   allowed_senders:
     type: list
     default: []
