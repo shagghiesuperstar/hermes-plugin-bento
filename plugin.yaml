@@ -1,0 +1,96 @@
+name: bento
+version: "0.1.0"
+manifest_version: 2
+api_version: 1
+description: >-
+  Bento (bentonow.com) email marketing for Hermes: subscribers, tags, fields,
+  events incl. $purchase, stats, draft/scheduled broadcasts and transactional
+  email, with dry-run + hash-bound confirm tokens + human-approval gates on
+  every send. Stdlib only.
+author: shagghiesuperstar
+license: MIT
+homepage: https://github.com/shagghiesuperstar/hermes-plugin-bento
+requires_hermes: ">=0.21.5"
+tags: [email, marketing, bento, crm]
+provides_tools:
+  - bento_subscriber_get
+  - bento_subscriber_upsert
+  - bento_subscriber_tag
+  - bento_subscriber_consent
+  - bento_tag_list
+  - bento_tag_create
+  - bento_field_list
+  - bento_field_create
+  - bento_event_track
+  - bento_purchase_track
+  - bento_broadcast_list
+  - bento_broadcast_create
+  - bento_broadcast_schedule
+  - bento_email_send
+  - bento_stats
+provides_hooks:
+  - pre_tool_call
+requires_env:
+  - name: BENTO_PUBLISHABLE_KEY
+    description: Bento publishable API key (pk_...)
+    url: https://app.bentonow.com/account/teams
+    secret: true
+  - name: BENTO_SECRET_KEY
+    description: Bento secret API key (sk_...)
+    url: https://app.bentonow.com/account/teams
+    secret: true
+  - name: BENTO_SITE_UUID
+    description: Bento site UUID (selects which site every call targets)
+    url: https://app.bentonow.com/account/teams
+    secret: false
+config_schema:
+  environment:
+    type: str
+    choices: [production, staging, disabled]
+    default: production
+    description: "'disabled' makes every write/send tool refuse (Bento advises against sending data from local/CI)."
+  allowed_senders:
+    type: list
+    default: []
+    description: Verified Bento Author emails allowed as From. Empty list = broadcast scheduling and email sending are refused.
+  bulk_threshold:
+    type: int
+    default: 25
+    description: Subscriber upserts above this size are treated as Tier 2 (approval-gated).
+  safety.tier2:
+    type: str
+    choices: [approve, token_only]
+    default: approve
+    description: Tier-2 writes (events, purchases, consent, bulk upserts) need a human approval (approve) or a dry-run confirm token only (token_only).
+  min_schedule_lead_minutes:
+    type: int
+    default: 30
+    description: A scheduled broadcast must start at least this many minutes in the future.
+  max_batch_size_per_hour:
+    type: int
+    default: 5000
+    description: Upper bound for broadcast batch_size_per_hour.
+  max_recipients_per_call:
+    type: int
+    default: 10
+    description: Upper bound on recipients in one bento_email_send call (hard API cap is 60).
+  allow_transactional_override:
+    type: bool
+    default: false
+    description: Permit transactional=true on bento_email_send (bypasses unsubscribe suppression; needs a reason on every call).
+  stats_cache_ttl_seconds:
+    type: int
+    default: 900
+    description: Cache lifetime for /stats/* responses (Bento allows 30 requests/hour/IP).
+  request_timeout_seconds:
+    type: int
+    default: 30
+    description: Per-request HTTP timeout.
+  audit.log_emails:
+    type: bool
+    default: false
+    description: Store raw recipient emails in the audit log instead of hashes.
+  base_url:
+    type: str
+    default: ""
+    description: Optional API base override. Only https://*.bentonow.com or http://localhost / 127.0.0.1 are accepted.

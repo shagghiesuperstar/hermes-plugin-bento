@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68,<81"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-plugin-bento"
+version = "0.1.0"
+description = "Hermes Agent plugin for Bento (bentonow.com): subscribers, tags, events, broadcasts, transactional email with enforced dry-run and approval gates."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "shagghiesuperstar" }]
+# Runtime is stdlib-only (urllib/json/hashlib/hmac). No third-party dependencies.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/shagghiesuperstar/hermes-plugin-bento"
+
+[project.entry-points."hermes_agent.plugins"]
+# Bare module (it exposes register()): works on every loader generation, as in the Apify plugin.
+bento = "bento_hermes"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+# pyflakes + syntax errors only: the suite is the quality gate; style rules are not enforced in CI.
+select = ["E9", "F"]

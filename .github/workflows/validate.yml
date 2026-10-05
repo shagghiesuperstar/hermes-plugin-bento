@@ -1,0 +1,43 @@
+name: validate
+
+# Runs the same two gates the Hermes plugin catalog CI runs against the pinned SHA.
+# NOTE: this workflow has not been executed yet (written offline, locally the same two commands
+# were run against a Hermes checkout). Verify the first CI run before relying on it, and review
+# before bumping HERMES_REF.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  HERMES_REPO: https://github.com/NousResearch/hermes-agent
+  HERMES_REF: 9b6fc23baf2628e3331b57210ee7e27edc98ae9e
+
+jobs:
+  hermes-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: plugin
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_REF }}
+          path: hermes-agent
+      - uses: astral-sh/setup-uv@v5
+      - name: Install Hermes from the pinned checkout
+        run: |
+          cd hermes-agent
+          uv venv --python 3.14
+          uv pip install -e .
+      - name: hermes plugins doctor
+        run: |
+          source hermes-agent/.venv/bin/activate
+          hermes plugins doctor plugin --ci
+      - name: hermes plugins validate
+        run: |
+          source hermes-agent/.venv/bin/activate
+          hermes plugins validate plugin --install-deps

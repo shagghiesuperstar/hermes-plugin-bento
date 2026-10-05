@@ -1,0 +1,17 @@
+{
+  "_comment": "Response shape from https://bentonow.com/docs/subscribers (GET /fetch/subscribers). Fabricated test data, not a live recording.",
+  "data": {
+    "id": "123",
+    "type": "visitors",
+    "attributes": {
+      "uuid": "sub_abc12345",
+      "email": "jane@example.com",
+      "fields": {"first_name": "Jane", "plan": "pro"},
+      "cached_tag_ids": ["1"],
+      "tags": ["vip"],
+      "unsubscribed_at": null,
+      "unsubscribed_reason": null,
+      "attribution": {"first_referral": "https://example.com", "first_page": "/", "campaign_data": {}}
+    }
+  }
+}
