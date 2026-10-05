@@ -1,9 +1,7 @@
 name: validate
 
 # Runs the same two gates the Hermes plugin catalog CI runs against the pinned SHA.
-# NOTE: this workflow has not been executed yet (written offline, locally the same two commands
-# were run against a Hermes checkout). Verify the first CI run before relying on it, and review
-# before bumping HERMES_REF.
+# First run on v0.1.0 passed (doctor --ci + validate --install-deps). Review before bumping HERMES_REF.
 on:
   push:
   pull_request:
